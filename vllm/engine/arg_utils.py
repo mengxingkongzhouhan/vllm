@@ -636,6 +636,14 @@ class EngineArgs:
     )
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+    length_aware_threshold: int = SchedulerConfig.length_aware_threshold
+    length_aware_long_max_wait_ms: float = (
+        SchedulerConfig.length_aware_long_max_wait_ms
+    )
+    length_aware_long_token_reservation: float = (
+        SchedulerConfig.length_aware_long_token_reservation
+    )
+    length_aware_long_burst_steps: int = SchedulerConfig.length_aware_long_burst_steps
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
@@ -1387,6 +1395,22 @@ class EngineArgs:
             "--scheduling-policy", **scheduler_kwargs["policy"]
         )
         scheduler_group.add_argument(
+            "--length-aware-threshold",
+            **scheduler_kwargs["length_aware_threshold"],
+        )
+        scheduler_group.add_argument(
+            "--length-aware-long-max-wait-ms",
+            **scheduler_kwargs["length_aware_long_max_wait_ms"],
+        )
+        scheduler_group.add_argument(
+            "--length-aware-long-token-reservation",
+            **scheduler_kwargs["length_aware_long_token_reservation"],
+        )
+        scheduler_group.add_argument(
+            "--length-aware-long-burst-steps",
+            **scheduler_kwargs["length_aware_long_burst_steps"],
+        )
+        scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
                 **scheduler_kwargs["enable_chunked_prefill"],
@@ -2035,6 +2059,12 @@ class EngineArgs:
             is_multimodal_model=model_config.is_multimodal_model,
             is_encoder_decoder=model_config.is_encoder_decoder,
             policy=self.scheduling_policy,
+            length_aware_threshold=self.length_aware_threshold,
+            length_aware_long_max_wait_ms=self.length_aware_long_max_wait_ms,
+            length_aware_long_token_reservation=(
+                self.length_aware_long_token_reservation
+            ),
+            length_aware_long_burst_steps=self.length_aware_long_burst_steps,
             scheduler_cls=self.scheduler_cls,
             max_num_partial_prefills=self.max_num_partial_prefills,
             max_long_partial_prefills=self.max_long_partial_prefills,
