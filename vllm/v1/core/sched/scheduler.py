@@ -558,16 +558,6 @@ class Scheduler(SchedulerInterface):
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
-
-                # Length-aware: refine the peeked request's short/long lane using
-                # any external cache hit memoized on a previous step, then re-peek
-                # since the lane ordering may have changed. Only meaningful when a
-                # KV connector can contribute external hits. This runs before any
-                # pop, so peek/pop consistency for this iteration is preserved.
-                if self.connector is not None:
-                    request_queue.reclassify(request)
-                    request = request_queue.peek_request()
-
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -626,14 +616,6 @@ class Scheduler(SchedulerInterface):
                             continue
 
                         num_external_computed_tokens = ext_tokens
-
-                        # Memoize the external (connector) prefix hit so
-                        # length-aware scheduling can include it in the compute
-                        # length on subsequent (re)classifications without
-                        # re-querying the connector (its lookup can mutate state).
-                        request.num_external_computed_tokens = (
-                            num_external_computed_tokens
-                        )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -1654,34 +1636,23 @@ class Scheduler(SchedulerInterface):
 
     def _num_tokens_to_compute(self, request: Request) -> int:
         """Number of tokens that still need to be computed for `request`, i.e.
-        its length after removing BOTH local and external prefix-cache hits.
+        its length after removing local prefix-cache hits.
 
         Used by the length-aware policy to classify short vs long prefills by
         real compute cost rather than raw prompt length.
 
-        The two hit sources are handled differently because of how/when they
-        become known:
-
-        - Local vLLM prefix cache: looked up read-only here, every time
-          (`KVCacheManager.get_num_cached_tokens`).
-        - External KV-connector cache (P/D, offloading): read from
-          `request.num_external_computed_tokens`, a value memoized by the
-          scheduler loop. The connector's own hit query can mutate request
-          state (e.g. NIXL truncates mamba prefixes), so it must never be
-          called speculatively at classification time. Consequently a brand-new
-          request's first classification sees external hits only if already
-          known; the estimate self-corrects once the connector has been queried
-          (e.g. after preemption/re-enqueue).
+        NOTE: only vLLM's local prefix cache is consulted here (read-only, via
+        `KVCacheManager.get_num_cached_tokens`). Externally-cached tokens served
+        by a KV connector (P/D, offloading) are NOT subtracted: the connector's
+        hit query can have side effects and must not be called speculatively at
+        classification time. Including external hits is future work (would need
+        a dedicated side-effect-free connector "peek" API).
         """
         if request.num_computed_tokens > 0:
-            # Resumed/partially-computed request: what's left is unambiguous
-            # (num_computed_tokens already folds in local + external hits).
+            # Resumed/partially-computed request: what's left is unambiguous.
             return max(request.num_tokens - request.num_computed_tokens, 0)
         num_local_cached = self.kv_cache_manager.get_num_cached_tokens(request)
-        num_external_cached = request.num_external_computed_tokens
-        return max(
-            request.num_tokens - num_local_cached - num_external_cached, 0
-        )
+        return max(request.num_tokens - num_local_cached, 0)
 
     @staticmethod
     def _is_recovery_request(request: Request) -> bool:

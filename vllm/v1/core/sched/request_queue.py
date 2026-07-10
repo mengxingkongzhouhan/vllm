@@ -86,15 +86,6 @@ class RequestQueue(ABC):
         """
         return None
 
-    def reclassify(self, request: Request) -> None:
-        """Hook to re-evaluate where `request` belongs in the queue given newly
-        available information (e.g. an external cache hit discovered on a prior
-        step). No-op by default; length-aware queues may move the request
-        between internal lanes. Must not be called between a `peek_request` and
-        its corresponding `pop_request`.
-        """
-        return None
-
 
 class FCFSRequestQueue(deque[Request], RequestQueue):
     """A first-come-first-served queue that supports deque operations."""
@@ -396,28 +387,6 @@ class LengthAwareRequestQueue(RequestQueue):
         queue = self._classify(request, force_immediate=False)
         queue.add_request(request)
         self._track(request, queue)
-
-    def reclassify(self, request: Request) -> None:
-        """Move `request` to the lane matching its *current* compute length.
-
-        Used when new information (typically a memoized external cache hit)
-        changes the short/long verdict for a request already sitting in the
-        queue. Immediate/pinned requests and untracked requests are left as-is.
-        """
-        rid = request.request_id
-        current = self._queue_index.get(rid)
-        if current is None or current is self._immediate:
-            return
-        target = self._classify(request, force_immediate=False)
-        if target is current:
-            return
-        current.remove_request(request)
-        target.add_request(request)
-        self._queue_index[rid] = target
-        if target is self._long:
-            self._long_enqueue_at.setdefault(rid, time.monotonic())
-        else:
-            self._long_enqueue_at.pop(rid, None)
 
     def pop_request(self) -> Request:
         queue = self._select()
