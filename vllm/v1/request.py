@@ -143,6 +143,12 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Best-effort memo of the externally-cached (KV connector) prefix hit
+        # for this request, recorded by the scheduler the first time it queries
+        # the connector. Used by length-aware scheduling to estimate the real
+        # compute length (prompt minus local *and* external cache hits) without
+        # re-querying the connector (whose hit lookup can have side effects).
+        self.num_external_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
