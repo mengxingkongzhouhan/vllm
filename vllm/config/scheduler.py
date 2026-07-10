@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "length_aware"]
 
 
 @config
@@ -112,7 +112,43 @@ class SchedulerConfig:
     - "fcfs" means first come first served, i.e. requests are handled in order 
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "length_aware" means length-aware prefill scheduling: the waiting queue is
+      split into immediate / short / long lanes and short prefills are scheduled
+      ahead of long ones to reduce head-of-line blocking, with a token-bucket
+      anti-starvation mechanism bounding how long a long prefill can be held
+      back. Inspired by vllm-ascend PR #10285 (LAPS). Unlike LAPS, the short vs
+      long classification uses the number of tokens that still need to be
+      computed *after* prefix-cache hits are removed, not the raw prompt length.
+      See the ``length_aware_*`` fields below to tune it."""
+
+    length_aware_threshold: int = 256
+    """[length_aware policy] Prompts whose number of tokens *to compute* (prompt
+    length minus prefix-cache hit) is ``<= length_aware_threshold`` are treated
+    as short prefills."""
+
+    length_aware_long_max_wait_ms: float = 0.0
+    """[length_aware policy] Anti-starvation aging bound for long prefills, in
+    milliseconds. ``0`` disables aging (strict short-first). Once the oldest long
+    request has waited ``>= length_aware_long_max_wait_ms`` it becomes eligible
+    to be promoted ahead of waiting shorts, but only through the token-reservation
+    bucket (see ``length_aware_long_token_reservation``). Requires
+    ``length_aware_long_token_reservation > 0`` when set."""
+
+    length_aware_long_token_reservation: float = 0.0
+    """[length_aware policy] Average fraction (``[0.0, 1.0]``) of the per-step
+    token budget reserved for admitting aged-long prefills ahead of waiting
+    shorts. Implemented as a token bucket: it refills by
+    ``reservation * per-step token budget`` every step and admitting an aged-long
+    ahead of shorts spends the long's full remaining compute length. This caps
+    the aged-long admission rate and prevents a backlog of longs from starving
+    shorts. Must be ``> 0`` whenever ``length_aware_long_max_wait_ms > 0``."""
+
+    length_aware_long_burst_steps: int = 4
+    """[length_aware policy] Burst window, in scheduling steps, the aged-long
+    bucket may accumulate: capacity = ``reservation * per-step token budget *
+    length_aware_long_burst_steps``. Advanced knob; the default suits most
+    workloads."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
@@ -254,7 +290,47 @@ class SchedulerConfig:
                 self.long_prefill_token_threshold,
             )
 
+        self.verify_length_aware_config()
+
         self.verify_max_model_len(max_model_len)
+
+    def verify_length_aware_config(self) -> None:
+        if self.policy != "length_aware":
+            return
+        if self.length_aware_threshold < 0:
+            raise ValueError(
+                "length_aware_threshold must be non-negative; got "
+                f"{self.length_aware_threshold}"
+            )
+        if self.length_aware_long_max_wait_ms < 0:
+            raise ValueError(
+                "length_aware_long_max_wait_ms must be >= 0; got "
+                f"{self.length_aware_long_max_wait_ms}"
+            )
+        if not 0.0 <= self.length_aware_long_token_reservation <= 1.0:
+            raise ValueError(
+                "length_aware_long_token_reservation must be in [0.0, 1.0]; got "
+                f"{self.length_aware_long_token_reservation}"
+            )
+        if (
+            self.length_aware_long_max_wait_ms > 0
+            and self.length_aware_long_token_reservation <= 0
+        ):
+            # The token-reservation bucket is the only channel that admits aged
+            # longs ahead of waiting shorts. With reservation == 0 the bucket
+            # never refills, so an enabled aging bound would be inert. Require an
+            # explicit positive reservation instead.
+            raise ValueError(
+                "length_aware_long_token_reservation must be > 0 when "
+                "length_aware_long_max_wait_ms > 0 (aging enabled); got "
+                f"long_max_wait_ms={self.length_aware_long_max_wait_ms}, "
+                f"reservation={self.length_aware_long_token_reservation}"
+            )
+        if self.length_aware_long_burst_steps < 1:
+            raise ValueError(
+                "length_aware_long_burst_steps must be >= 1; got "
+                f"{self.length_aware_long_burst_steps}"
+            )
 
     def verify_max_model_len(self, max_model_len: int) -> Self:
         if (

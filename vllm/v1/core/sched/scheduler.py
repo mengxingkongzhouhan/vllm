@@ -161,9 +161,9 @@ class Scheduler(SchedulerInterface):
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        self.waiting = self._create_request_queue()
         # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.skipped_waiting = self._create_request_queue()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -361,6 +361,11 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # Refresh per-step waiting-queue state (e.g. length-aware token bucket).
+        # No-op for FCFS/priority queues. Use the full per-step token budget as
+        # the reservation base so the aged-long bucket refills consistently.
+        self.waiting.begin_step(self.max_num_scheduled_tokens)
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -543,7 +548,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
+            step_skipped_waiting = self._create_request_queue()
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -1610,6 +1615,48 @@ class Scheduler(SchedulerInterface):
             RequestStatus.WAITING_FOR_STREAMING_REQ,
         )
 
+    def _create_request_queue(self) -> RequestQueue:
+        """Build a waiting queue for the configured scheduling policy.
+
+        For LENGTH_AWARE we inject a prefix-cache-aware length function and the
+        policy's tuning knobs; other policies ignore the extra arguments.
+        """
+        if self.policy == SchedulingPolicy.LENGTH_AWARE:
+            cfg = self.scheduler_config
+            return create_request_queue(
+                self.policy,
+                length_fn=self._num_tokens_to_compute,
+                threshold=cfg.length_aware_threshold,
+                long_max_wait_ms=cfg.length_aware_long_max_wait_ms,
+                long_token_reservation=cfg.length_aware_long_token_reservation,
+                long_burst_steps=cfg.length_aware_long_burst_steps,
+                immediate_predicate=self._is_recovery_request,
+            )
+        return create_request_queue(self.policy)
+
+    def _num_tokens_to_compute(self, request: Request) -> int:
+        """Number of tokens that still need to be computed for `request`, i.e.
+        its length after removing prefix-cache hits.
+
+        Used by the length-aware policy to classify short vs long prefills by
+        real compute cost rather than raw prompt length. Only the local vLLM
+        prefix cache is consulted (see `KVCacheManager.get_num_cached_tokens`).
+        """
+        if request.num_computed_tokens > 0:
+            # Resumed/partially-computed request: what's left is unambiguous.
+            return max(request.num_tokens - request.num_computed_tokens, 0)
+        num_cached = self.kv_cache_manager.get_num_cached_tokens(request)
+        return max(request.num_tokens - num_cached, 0)
+
+    @staticmethod
+    def _is_recovery_request(request: Request) -> bool:
+        """Recovery-style requests (preempted or already partially computed) are
+        routed to the length-aware immediate lane so they resume first."""
+        return (
+            request.status == RequestStatus.PREEMPTED
+            or request.num_computed_tokens > 0
+        )
+
     def _enqueue_waiting_request(self, request: Request) -> None:
         if self._is_blocked_waiting_status(request.status):
             self.skipped_waiting.add_request(request)
@@ -1617,7 +1664,11 @@ class Scheduler(SchedulerInterface):
             self.waiting.add_request(request)
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        if self.policy == SchedulingPolicy.FCFS:
+        if self.policy in (SchedulingPolicy.FCFS, SchedulingPolicy.LENGTH_AWARE):
+            # For LENGTH_AWARE the lane ordering (immediate/short/long + aging)
+            # lives inside the LengthAwareRequestQueue itself, so at this level
+            # we only need to drain the skipped queue first (deferred/blocked
+            # requests) and otherwise hand back the main waiting queue.
             return self.skipped_waiting or self.waiting or None
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.

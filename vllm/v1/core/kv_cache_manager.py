@@ -233,6 +233,39 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    def get_num_cached_tokens(self, request: Request) -> int:
+        """Read-only estimate of the local prefix-cache hit length, in tokens.
+
+        Unlike `get_computed_blocks`, this does NOT record prefix-cache stats,
+        touch blocks, or allocate anything -- it only looks up the block-hash
+        map. It is intended for scheduling decisions that need to know how many
+        tokens can be skipped (i.e. how many tokens actually need to be
+        computed) *before* the request is popped from the waiting queue, such as
+        length-aware prefill scheduling.
+
+        NOTE: this only reflects vLLM's local prefix cache; externally cached
+        tokens served by a KVConnector (P/D, offloading) are not included.
+
+        Args:
+            request: The request to estimate the cache hit for.
+
+        Returns:
+            The number of prefix tokens already cached locally (0 if prefix
+            caching is disabled, reads are skipped, or no block hashes exist).
+        """
+        if (
+            not self.enable_caching
+            or request.skip_reading_prefix_cache
+            or not request.block_hashes
+        ):
+            return 0
+        # Mirror get_computed_blocks: keep the last token for logits.
+        max_cache_hit_length = request.num_tokens - 1
+        _, num_new_computed_tokens = self.coordinator.find_longest_cache_hit(
+            request.block_hashes, max_cache_hit_length
+        )
+        return num_new_computed_tokens
+
     def allocate_slots(
         self,
         request: Request,
