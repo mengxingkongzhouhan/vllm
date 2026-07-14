@@ -1636,23 +1636,34 @@ class Scheduler(SchedulerInterface):
 
     def _num_tokens_to_compute(self, request: Request) -> int:
         """Number of tokens that still need to be computed for `request`, i.e.
-        its length after removing local prefix-cache hits.
+        its length after removing local AND remote cache hits.
 
         Used by the length-aware policy to classify short vs long prefills by
-        real compute cost rather than raw prompt length.
+        real compute cost rather than raw prompt length. This is evaluated
+        lazily at scheduling/selection time (not at enqueue), so both hit
+        sources reflect the live cache state:
 
-        NOTE: only vLLM's local prefix cache is consulted here (read-only, via
-        `KVCacheManager.get_num_cached_tokens`). Externally-cached tokens served
-        by a KV connector (P/D, offloading) are NOT subtracted: the connector's
-        hit query can have side effects and must not be called speculatively at
-        classification time. Including external hits is future work (would need
-        a dedicated side-effect-free connector "peek" API).
+        - Local vLLM prefix cache: `KVCacheManager.get_num_cached_tokens`
+          (read-only lookup, no stats/touch/alloc).
+        - Remote KV-connector cache (P/D, offloading):
+          `connector.peek_num_new_matched_tokens`, a strictly side-effect-free
+          hint. If the connector cannot determine it (returns `None`/0), the
+          remote hit defaults to 0.
         """
         if request.num_computed_tokens > 0:
             # Resumed/partially-computed request: what's left is unambiguous.
             return max(request.num_tokens - request.num_computed_tokens, 0)
         num_local_cached = self.kv_cache_manager.get_num_cached_tokens(request)
-        return max(request.num_tokens - num_local_cached, 0)
+        num_remote_cached = 0
+        if self.connector is not None:
+            # Strictly side-effect-free peek; unknown/None -> 0.
+            peeked = self.connector.peek_num_new_matched_tokens(
+                request, num_local_cached
+            )
+            num_remote_cached = peeked or 0
+        return max(
+            request.num_tokens - num_local_cached - num_remote_cached, 0
+        )
 
     @staticmethod
     def _is_recovery_request(request: Request) -> bool:

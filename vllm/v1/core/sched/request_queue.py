@@ -222,37 +222,53 @@ def _default_length_fn(request: Request) -> int:
 class LengthAwareRequestQueue(RequestQueue):
     """Length-aware prefill scheduling queue.
 
-    Inspired by vllm-ascend PR #10285 (LAPS). The waiting queue is split into
-    three lanes and drained with priority ``immediate > aged-long > short >
-    long``:
+    Inspired by vllm-ascend PR #10285 (LAPS), but with a key structural
+    difference: **requests are NOT classified into short/long lanes at enqueue
+    time.** Prompt-length is a poor proxy for cost once caching is involved, and
+    -- more importantly -- how many tokens actually need to be computed depends
+    on the *live* cache state (local prefix cache + external KV-connector
+    cache), which changes over time and is only cheaply/safely knowable at
+    scheduling time.
 
-    - **immediate**: recovery-style requests (preempted / already partially
-      computed) that should be resumed first. Populated via ``prepend_request``
-      or the optional ``immediate_predicate``.
-    - **short**: prefills whose number of tokens *to compute* is
+    Instead, classification happens lazily at **selection time**: whenever a
+    request is about to be admitted to the running set, the queue scans all
+    waiting requests, computes each one's real compute length via
+    ``length_fn(request)`` (prompt minus local *and* remote cache hits), and
+    partitions them into short (``compute_len <= threshold``) and long
+    (``> threshold``). Dispatch priority is::
+
+        immediate > aged-long > short > long
+
+    - **immediate**: recovery-style requests (preempted / partially computed),
+      dispatched first. Populated via ``prepend_request`` or the optional
+      ``immediate_predicate``. These are held in a small side lane and are not
+      re-scanned for length.
+    - **short**: the oldest waiting request whose (live) compute length is
       ``<= threshold``.
-    - **long**: prefills whose number of tokens *to compute* is ``> threshold``.
-
-    The key difference from LAPS: the short/long split uses ``length_fn(request)``
-    -- the number of tokens that still need to be computed **after prefix-cache
-    hits are removed** -- instead of the raw prompt length. So a long prompt that
-    is mostly a cache hit is (correctly) treated as short.
+    - **long**: everything else, dispatched only when no short is available or
+      when the oldest long has aged past ``long_max_wait_ms``.
 
     Anti-starvation uses a token bucket: it refills by
     ``long_token_reservation * per-step token budget`` every ``begin_step`` and,
-    once the oldest long has waited ``>= long_max_wait_ms``, an aged long may be
+    once the oldest long has waited ``>= long_max_wait_ms``, that long may be
     promoted ahead of waiting shorts only while the bucket has credit. Admitting
     an aged long ahead of shorts spends its full remaining compute length from
     the bucket, so the aged-long admission rate stays bounded by the reservation
     fraction and shorts always retain ``1 - reservation`` of throughput.
 
-    The three internal lanes are plain FCFS queues so that "oldest long" and
-    arrival order are well defined; this policy therefore assumes a single total
-    arrival order (like FCFS).
+    Requests (other than immediate) are held in a single FCFS structure so that
+    "oldest" is well defined; this policy assumes a single total arrival order
+    (like FCFS).
+
+    Cost note: selection is O(N) in the number of waiting requests (it evaluates
+    ``length_fn`` for each), so a scan is done per admitted request. The result
+    of a ``peek_request`` is cached and reused by the immediately following
+    ``pop_request`` (no queue mutation happens in between), and the cache is
+    invalidated on any mutation and at ``begin_step``.
 
     NOTE: the bucket is charged inside ``pop_request``. The scheduler also pops
     from this queue on rare "skip" paths (e.g. a request that momentarily
-    exceeds ``max_loras``); those pops may count as an aged-long promotion. This
+    exceeds ``max_loras``); such a pop may count as an aged-long promotion. This
     is a deliberate, benign approximation -- an occasional extra charge only
     slows aged-long admission, which errs toward protecting short requests.
     """
@@ -273,17 +289,17 @@ class LengthAwareRequestQueue(RequestQueue):
         self.long_burst_steps = long_burst_steps
         self.immediate_predicate = immediate_predicate
 
-        # Inner lanes are FCFS so arrival order (and thus "oldest long") holds.
+        # Recovery/preempted requests, dispatched first (not length-scanned).
         self._immediate = FCFSRequestQueue()
-        self._short = FCFSRequestQueue()
-        self._long = FCFSRequestQueue()
+        # Everyone else, in arrival order. NO short/long split here -- that is
+        # decided at selection time from the live compute length.
+        self._waiting = FCFSRequestQueue()
 
         # req_id -> the lane currently holding the request.
         self._queue_index: dict[str, RequestQueue] = {}
-        # req_id -> monotonic timestamp the request entered the long lane.
-        self._long_enqueue_at: dict[str, float] = {}
-        # req_id -> tokens-to-compute recorded at classification (bucket charge).
-        self._compute_len: dict[str, int] = {}
+        # req_id -> monotonic timestamp the request entered the waiting lane
+        # (used for aging).
+        self._enqueue_at: dict[str, float] = {}
         # req_ids explicitly forced into the immediate lane (recovery flows).
         self._force_immediate_ids: set[str] = set()
 
@@ -291,6 +307,11 @@ class LengthAwareRequestQueue(RequestQueue):
         self._long_bucket = 0.0
         self._long_bucket_capacity = 0.0
         self._long_refill_per_step = 0.0
+
+        # Cached selection: (request, charge_tokens). charge_tokens > 0 only for
+        # an aged-long promotion that jumps waiting shorts. Invalidated on any
+        # mutation and at begin_step.
+        self._selection: tuple[Request, int] | None = None
 
     # ------------------------------------------------------------------ #
     # Per-step hook
@@ -303,142 +324,153 @@ class LengthAwareRequestQueue(RequestQueue):
             self._long_bucket_capacity,
             self._long_bucket + self._long_refill_per_step,
         )
+        # Live cache state may have changed since last step, so any cached
+        # selection (which depends on compute lengths) is now stale.
+        self._selection = None
 
     # ------------------------------------------------------------------ #
-    # Classification & bookkeeping
+    # Bookkeeping
     # ------------------------------------------------------------------ #
-    def _classify(self, request: Request, force_immediate: bool) -> RequestQueue:
+    def _lane_for_enqueue(
+        self, request: Request, force_immediate: bool
+    ) -> RequestQueue:
         rid = request.request_id
         if force_immediate or rid in self._force_immediate_ids:
             return self._immediate
         if self.immediate_predicate is not None and self.immediate_predicate(request):
             return self._immediate
-        compute_len = max(self.length_fn(request), 0)
-        self._compute_len[rid] = compute_len
-        return self._short if compute_len <= self.threshold else self._long
+        return self._waiting
 
-    def _track(self, request: Request, queue: RequestQueue) -> None:
+    def _track(self, request: Request, lane: RequestQueue) -> None:
         rid = request.request_id
-        self._queue_index[rid] = queue
-        if queue is self._long:
-            self._long_enqueue_at.setdefault(rid, time.monotonic())
+        self._queue_index[rid] = lane
+        self._enqueue_at.setdefault(rid, time.monotonic())
 
-    def _forget(self, request: Request, queue: RequestQueue) -> None:
+    def _forget(self, request: Request, lane: RequestQueue) -> None:
         rid = request.request_id
         self._queue_index.pop(rid, None)
-        self._long_enqueue_at.pop(rid, None)
-        self._compute_len.pop(rid, None)
+        self._enqueue_at.pop(rid, None)
         self._force_immediate_ids.discard(rid)
 
     # ------------------------------------------------------------------ #
-    # Selection
+    # Selection (scans all waiting requests each time)
     # ------------------------------------------------------------------ #
-    def _long_head_wait_ms(self) -> float | None:
-        if self.long_max_wait_ms <= 0 or not self._long:
-            return None
-        head = self._long.peek_request()  # FCFS head = oldest long.
-        enqueued_at = self._long_enqueue_at.get(head.request_id)
-        if enqueued_at is None:
-            return None
-        return (time.monotonic() - enqueued_at) * 1000.0
-
-    def _select(self) -> RequestQueue | None:
-        """Pick the lane to dispatch from (no side effects)."""
+    def _compute_selection(self) -> tuple[Request, int] | None:
+        # Immediate (recovery) requests always win and are not length-scanned.
         if self._immediate:
-            return self._immediate
-        if self._long:
-            wait_ms = self._long_head_wait_ms()
-            if wait_ms is not None and wait_ms >= self.long_max_wait_ms:
-                if not self._short:
-                    # Stall avoidance: no short is waiting, so run the long.
-                    return self._long
+            return (self._immediate.peek_request(), 0)
+
+        now = time.monotonic()
+        oldest_short: Request | None = None
+        oldest_long: Request | None = None
+        oldest_long_len = 0
+        has_short = False
+
+        # Single pass in arrival order: the first short/long encountered is the
+        # oldest short/long. compute length is evaluated live for every request.
+        for request in self._waiting:
+            compute_len = max(self.length_fn(request), 0)
+            if compute_len <= self.threshold:
+                has_short = True
+                if oldest_short is None:
+                    oldest_short = request
+            elif oldest_long is None:
+                oldest_long = request
+                oldest_long_len = compute_len
+
+        # Anti-starvation: the oldest long, once aged, may be promoted ahead of
+        # waiting shorts, gated by the token-reservation bucket.
+        if oldest_long is not None and self.long_max_wait_ms > 0:
+            enqueued_at = self._enqueue_at.get(oldest_long.request_id, now)
+            waited_ms = (now - enqueued_at) * 1000.0
+            if waited_ms >= self.long_max_wait_ms:
+                if not has_short:
+                    # Stall avoidance: no short waiting, run the long (no charge).
+                    return (oldest_long, 0)
                 if self._long_bucket > 0.0:
-                    # Reservation credit available: promote the aged long.
-                    return self._long
-                # Bucket exhausted and shorts are waiting: prefer shorts so the
+                    # Reservation credit available: promote and charge its full
+                    # remaining compute length.
+                    return (oldest_long, oldest_long_len)
+                # Bucket exhausted with shorts waiting: prefer shorts so the
                 # aged-long admission rate stays bounded by the reservation.
-        if self._short:
-            return self._short
-        if self._long:
-            return self._long
+
+        if oldest_short is not None:
+            return (oldest_short, 0)
+        if oldest_long is not None:
+            return (oldest_long, 0)
         return None
 
-    def _maybe_charge_aged_long(
-        self, request: Request, queue: RequestQueue
-    ) -> None:
-        if queue is not self._long or self.long_max_wait_ms <= 0:
-            return
-        enqueued_at = self._long_enqueue_at.get(request.request_id)
-        if enqueued_at is None:
-            return
-        wait_ms = (time.monotonic() - enqueued_at) * 1000.0
-        if wait_ms < self.long_max_wait_ms:
-            return
-        # Only counts as a promotion (and a charge) if it actually jumped waiting
-        # shorts. When no short is waiting it is stall avoidance -- not charged.
-        if len(self._short) == 0:
-            return
-        self._long_bucket -= self._compute_len.get(request.request_id, 0)
+    def _ensure_selection(self) -> tuple[Request, int] | None:
+        if self._selection is None:
+            self._selection = self._compute_selection()
+        return self._selection
 
     # ------------------------------------------------------------------ #
     # RequestQueue interface
     # ------------------------------------------------------------------ #
     def add_request(self, request: Request) -> None:
-        queue = self._classify(request, force_immediate=False)
-        queue.add_request(request)
-        self._track(request, queue)
+        lane = self._lane_for_enqueue(request, force_immediate=False)
+        lane.add_request(request)
+        self._track(request, lane)
+        self._selection = None
 
     def pop_request(self) -> Request:
-        queue = self._select()
-        if queue is None:
+        selection = self._ensure_selection()
+        if selection is None:
             raise IndexError("pop from an empty LengthAwareRequestQueue")
-        request = queue.pop_request()
-        self._maybe_charge_aged_long(request, queue)
-        self._forget(request, queue)
+        request, charge_tokens = selection
+        lane = self._queue_index.get(request.request_id, self._waiting)
+        lane.remove_request(request)
+        if charge_tokens > 0:
+            self._long_bucket -= charge_tokens
+        self._forget(request, lane)
+        self._selection = None
         return request
 
     def peek_request(self) -> Request:
-        queue = self._select()
-        if queue is None:
+        selection = self._ensure_selection()
+        if selection is None:
             raise IndexError("peek from an empty LengthAwareRequestQueue")
-        return queue.peek_request()
+        return selection[0]
 
     def prepend_request(self, request: Request) -> None:
         # Prepend == recovery/resume; always route to the immediate lane so the
-        # request is dispatched before any newly arrived short/long prefill.
+        # request is dispatched before any newly arrived waiting prefill.
         self._force_immediate_ids.add(request.request_id)
         self._immediate.prepend_request(request)
         self._track(request, self._immediate)
+        self._selection = None
 
     def prepend_requests(self, requests: RequestQueue) -> None:
         for request in requests:
             self.prepend_request(request)
 
     def remove_request(self, request: Request) -> None:
-        queue = self._queue_index.get(request.request_id)
-        if queue is None:
+        lane = self._queue_index.get(request.request_id)
+        if lane is None:
             raise ValueError("request not found in LengthAwareRequestQueue")
-        queue.remove_request(request)
-        self._forget(request, queue)
+        lane.remove_request(request)
+        self._forget(request, lane)
+        self._selection = None
 
     def remove_requests(self, requests: Iterable[Request]) -> None:
         for request in requests:
-            queue = self._queue_index.get(request.request_id)
-            if queue is None:
+            lane = self._queue_index.get(request.request_id)
+            if lane is None:
                 continue
-            queue.remove_request(request)
-            self._forget(request, queue)
+            lane.remove_request(request)
+            self._forget(request, lane)
+        self._selection = None
 
     def __bool__(self) -> bool:
         return len(self) > 0
 
     def __len__(self) -> int:
-        return len(self._immediate) + len(self._short) + len(self._long)
+        return len(self._immediate) + len(self._waiting)
 
     def __iter__(self) -> Iterator[Request]:
         yield from self._immediate
-        yield from self._short
-        yield from self._long
+        yield from self._waiting
 
     def __contains__(self, request: object) -> bool:
         rid = getattr(request, "request_id", None)

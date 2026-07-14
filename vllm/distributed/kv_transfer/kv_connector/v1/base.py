@@ -485,6 +485,36 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def peek_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> int:
+        """Side-effect-free estimate of the number of externally-cached tokens
+        for a request, for use in scheduling decisions (e.g. length-aware
+        prefill scheduling) *before* a request is admitted.
+
+        Unlike ``get_num_new_matched_tokens``, this MUST be strictly
+        side-effect free: it must not reserve buffers, kick off async lookups,
+        mutate the request, or change any connector state, and it may be called
+        many times per request per step. It is a best-effort hint only.
+
+        The default implementation returns ``0`` (i.e. "no external hit
+        estimate available"), which is always safe. Connectors that can answer
+        cheaply and safely from an in-memory index may override it. Callers
+        treat a ``None`` return as ``0``.
+
+        Args:
+            request: the request object.
+            num_computed_tokens: the number of locally computed tokens for this
+                request (e.g. the local prefix-cache hit).
+
+        Returns:
+            The estimated number of externally-cached tokens beyond
+            ``num_computed_tokens`` (``0`` when unknown).
+        """
+        return 0
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
