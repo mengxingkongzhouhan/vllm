@@ -167,6 +167,19 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
+    def peek_num_new_matched_tokens(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> int:
+        # 只读、无副作用地估计远端命中，供长度感知调度使用（不记 LoadSpec）。
+        # worker 角色（无 scheduler 组件）返回 0。
+        if self.connector_scheduler is None:
+            return 0
+        return self.connector_scheduler.peek_num_new_matched_tokens(
+            request, num_computed_tokens
+        )
+
     def update_state_after_alloc(
         self,
         request: Request,

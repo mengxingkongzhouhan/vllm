@@ -165,6 +165,9 @@ class Scheduler(SchedulerInterface):
         # requests skipped in waiting flow due async deps or constraints.
         self.skipped_waiting = self._create_request_queue()
         self.running: list[Request] = []
+        # length_aware：本步内“请求 -> 远端命中 token 数”的缓存，避免同一步内对同一
+        # 请求重复发起（可能阻塞的）远端查询。每步开头清空。
+        self._remote_hit_cache: dict[str, int] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -364,6 +367,8 @@ class Scheduler(SchedulerInterface):
         # 刷新每步的等待队列状态（例如长度感知的令牌桶）。对 FCFS/priority 队列是
         # 空操作。用每步完整的 token 预算作为预留基准，使 aged-long 令牌桶稳定回填。
         self.waiting.begin_step(self.max_num_scheduled_tokens)
+        # 清空 length_aware 的每步远端命中缓存（远端缓存状态可能已变化）。
+        self._remote_hit_cache.clear()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -1644,21 +1649,42 @@ class Scheduler(SchedulerInterface):
         - 远端 KV 连接器缓存（P/D、offloading）：
           `connector.peek_num_new_matched_tokens`，一个严格无副作用的提示。若连接器
           无法给出（返回 `None`/0），远端命中默认为 0。
+
+        性能优化（远端查询可能是一次阻塞 RPC，如 Mooncake）：
+        1) 短路：若仅按本地命中该请求已经是“短”（``num_tokens - 本地命中 <=
+           threshold``），远端命中只会让它更短、不会改变短/长判定，因此跳过远端查询。
+        2) 每步缓存：同一步内每个请求的远端命中最多查一次（见
+           ``_length_aware_remote_hit``），缓存在每步开头清空。
         """
         if request.num_computed_tokens > 0:
             # 续跑/已部分计算的请求：剩余量是明确的。
             return max(request.num_tokens - request.num_computed_tokens, 0)
         num_local_cached = self.kv_cache_manager.get_num_cached_tokens(request)
-        num_remote_cached = 0
-        if self.connector is not None:
-            # 严格无副作用的 peek；未知/None -> 0。
-            peeked = self.connector.peek_num_new_matched_tokens(
-                request, num_local_cached
-            )
-            num_remote_cached = peeked or 0
-        return max(
-            request.num_tokens - num_local_cached - num_remote_cached, 0
-        )
+        local_only_len = request.num_tokens - num_local_cached
+        # 短路：无连接器，或仅按本地已判为短，则无需查远端。
+        threshold = self.scheduler_config.length_aware_threshold
+        if self.connector is None or local_only_len <= threshold:
+            return max(local_only_len, 0)
+        # 仅按本地判为长：远端命中可能把它拉成短，才值得查一次（每步缓存、无副作用）。
+        num_remote_cached = self._length_aware_remote_hit(request, num_local_cached)
+        return max(local_only_len - num_remote_cached, 0)
+
+    def _length_aware_remote_hit(
+        self, request: Request, num_local_cached: int
+    ) -> int:
+        """返回该请求超出本地命中之外、可从远端 KV 连接器命中的 token 数。
+
+        对每个请求每步最多做一次严格无副作用的 ``peek_num_new_matched_tokens``
+        查询（远端查询可能是阻塞 RPC，代价高），结果缓存在 ``_remote_hit_cache``
+        中，缓存在每个调度步开头清空。返回 ``None`` 按 0 处理。
+        """
+        cached = self._remote_hit_cache.get(request.request_id)
+        if cached is not None:
+            return cached
+        peeked = self.connector.peek_num_new_matched_tokens(request, num_local_cached)
+        hit = peeked or 0
+        self._remote_hit_cache[request.request_id] = hit
+        return hit
 
     @staticmethod
     def _is_recovery_request(request: Request) -> bool:
