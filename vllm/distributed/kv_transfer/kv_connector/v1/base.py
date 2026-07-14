@@ -485,6 +485,32 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def peek_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> int:
+        """无副作用地估计某请求可从外部（连接器）缓存命中的 token 数，供调度决策
+        在请求被真正准入*之前*使用（例如长度感知的 prefill 调度）。
+
+        与 ``get_num_new_matched_tokens`` 不同，本方法必须严格无副作用：不得预留
+        缓冲区、不得发起异步查询、不得改写请求或任何连接器状态，并且允许每步、每个
+        请求被调用多次。它只是一个尽力而为的提示。
+
+        默认实现返回 ``0``（即“无法给出外部命中估计”），这总是安全的。能从内存索引
+        里廉价且安全地给出答案的连接器可以覆写它。调用方会把返回的 ``None`` 当作
+        ``0`` 处理。
+
+        Args:
+            request: 请求对象。
+            num_computed_tokens: 该请求已在本地计算的 token 数（例如本地前缀缓存命中）。
+
+        Returns:
+            超出 ``num_computed_tokens`` 之外、估计可从外部缓存命中的 token 数
+            （未知时为 ``0``）。
+        """
+        return 0
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

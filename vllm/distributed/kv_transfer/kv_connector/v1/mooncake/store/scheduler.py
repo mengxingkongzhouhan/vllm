@@ -120,6 +120,33 @@ class MooncakeStoreScheduler:
 
         return need_to_allocate, self.load_async
 
+    def peek_num_new_matched_tokens(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+    ) -> int:
+        """只读地估计可从远端存储命中、且超出 ``num_computed_tokens`` 的 token 数。
+
+        与 ``get_num_new_matched_tokens`` 复用同一条查询路径（``LookupKeyClient``
+        -> worker ``batch_is_exist`` -> ``find_longest_cache_hit``），但**不记录任何
+        ``LoadSpec``、不改动任何状态**，因此严格无副作用、可被多次调用，供长度感知
+        调度在选择时估计实际计算长度。注意底层 ``lookup`` 仍是一次（可能阻塞的）RPC，
+        调用方应自行限流/缓存。
+        """
+        token_len = request.num_tokens // self._block_size * self._block_size
+        if token_len < self._block_size:
+            return 0
+        num_external_hit_tokens = self.client.lookup(token_len, request.block_hashes)
+        if num_external_hit_tokens == request.num_tokens:
+            # 与 get_num_new_matched_tokens 保持一致：留一个 block 尾巴用于采样。
+            num_external_hit_tokens = max(
+                0,
+                (request.num_tokens - 1) // self._block_size * self._block_size,
+            )
+        if num_external_hit_tokens <= num_computed_tokens:
+            return 0
+        return num_external_hit_tokens - num_computed_tokens
+
     def update_state_after_alloc(
         self,
         request: Request,

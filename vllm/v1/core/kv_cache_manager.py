@@ -233,6 +233,37 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
+    def get_num_cached_tokens(self, request: Request) -> int:
+        """只读地估计本地前缀缓存命中的长度（以 token 计）。
+
+        与 `get_computed_blocks` 不同，本方法不记录前缀缓存统计、不 touch 任何 block、
+        也不分配任何东西——只查 block-hash 表。它用于那些需要在请求被弹出等待队列
+        *之前*就知道“能跳过多少 token”（即实际还需计算多少 token）的调度决策，
+        例如长度感知的 prefill 调度。
+
+        注意：这里只反映 vLLM 的本地前缀缓存；由 KVConnector（P/D、offloading）提供的
+        外部缓存命中不包含在内。
+
+        Args:
+            request: 需要估计缓存命中的请求。
+
+        Returns:
+            已在本地缓存的前缀 token 数（若关闭前缀缓存、跳过读取或没有 block hash，
+            则返回 0）。
+        """
+        if (
+            not self.enable_caching
+            or request.skip_reading_prefix_cache
+            or not request.block_hashes
+        ):
+            return 0
+        # 与 get_computed_blocks 保持一致：保留最后一个 token 用于产生 logits。
+        max_cache_hit_length = request.num_tokens - 1
+        _, num_new_computed_tokens = self.coordinator.find_longest_cache_hit(
+            request.block_hashes, max_cache_hit_length
+        )
+        return num_new_computed_tokens
+
     def allocate_slots(
         self,
         request: Request,
