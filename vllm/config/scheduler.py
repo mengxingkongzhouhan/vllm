@@ -113,42 +113,35 @@ class SchedulerConfig:
       of arrival.
     - "priority" means requests are handled based on given priority (lower
       value means earlier handling) and time of arrival deciding any ties).
-    - "length_aware" means length-aware prefill scheduling: the waiting queue is
-      split into immediate / short / long lanes and short prefills are scheduled
-      ahead of long ones to reduce head-of-line blocking, with a token-bucket
-      anti-starvation mechanism bounding how long a long prefill can be held
-      back. Inspired by vllm-ascend PR #10285 (LAPS). Unlike LAPS, the short vs
-      long classification uses the number of tokens that still need to be
-      computed *after* prefix-cache hits are removed, not the raw prompt length.
-      See the ``length_aware_*`` fields below to tune it."""
+    - "length_aware" 表示长度感知的 prefill 调度：短 prefill 会被排在长 prefill
+      之前以减少队头阻塞，并用令牌桶（token bucket）防饿死机制限制长 prefill 最多
+      被压后多久。灵感来自 vllm-ascend PR #10285 (LAPS)。与 LAPS 不同的是：
+      (1) 短/长的判定依据是“扣除前缀缓存命中后仍需计算的 token 数”（实际计算长度），
+      而不是原始 prompt 长度；(2) 该分类在“选择（即将进入 running）时”对所有等待
+      请求实时求值，而不是在入队时。调参见下面的 ``length_aware_*`` 字段。"""
 
     length_aware_threshold: int = 256
-    """[length_aware policy] Prompts whose number of tokens *to compute* (prompt
-    length minus prefix-cache hit) is ``<= length_aware_threshold`` are treated
-    as short prefills."""
+    """[length_aware 策略] 计算长度（prompt 长度减去本地+远端缓存命中）
+    ``<= length_aware_threshold`` 的请求被视为短 prefill。"""
 
     length_aware_long_max_wait_ms: float = 0.0
-    """[length_aware policy] Anti-starvation aging bound for long prefills, in
-    milliseconds. ``0`` disables aging (strict short-first). Once the oldest long
-    request has waited ``>= length_aware_long_max_wait_ms`` it becomes eligible
-    to be promoted ahead of waiting shorts, but only through the token-reservation
-    bucket (see ``length_aware_long_token_reservation``). Requires
-    ``length_aware_long_token_reservation > 0`` when set."""
+    """[length_aware 策略] 长 prefill 的防饿死 aging 阈值（毫秒）。``0`` 表示关闭
+    aging（严格短优先）。当最老的长请求已等待 ``>= length_aware_long_max_wait_ms``
+    时，它变得“可被晋升”到等待中的短请求之前，但晋升只能通过令牌桶通道
+    （见 ``length_aware_long_token_reservation``）。设为正值时要求
+    ``length_aware_long_token_reservation > 0``。"""
 
     length_aware_long_token_reservation: float = 0.0
-    """[length_aware policy] Average fraction (``[0.0, 1.0]``) of the per-step
-    token budget reserved for admitting aged-long prefills ahead of waiting
-    shorts. Implemented as a token bucket: it refills by
-    ``reservation * per-step token budget`` every step and admitting an aged-long
-    ahead of shorts spends the long's full remaining compute length. This caps
-    the aged-long admission rate and prevents a backlog of longs from starving
-    shorts. Must be ``> 0`` whenever ``length_aware_long_max_wait_ms > 0``."""
+    """[length_aware 策略] 为“让老的长请求插到等待短请求之前”预留的平均 token 吞吐
+    比例（``[0.0, 1.0]``）。实现为令牌桶：每步回填 ``reservation * 每步 token 预算``，
+    每次让 aged-long 越过短请求就从桶里扣掉该长请求的整份剩余计算长度。这样把
+    aged-long 的准入速率限制在预留比例内，避免一堆长请求把短请求饿死。当
+    ``length_aware_long_max_wait_ms > 0`` 时必须 ``> 0``。"""
 
     length_aware_long_burst_steps: int = 4
-    """[length_aware policy] Burst window, in scheduling steps, the aged-long
-    bucket may accumulate: capacity = ``reservation * per-step token budget *
-    length_aware_long_burst_steps``. Advanced knob; the default suits most
-    workloads."""
+    """[length_aware 策略] 令牌桶可累积的突发窗口（以调度步为单位）：
+    桶容量 = ``reservation * 每步 token 预算 * length_aware_long_burst_steps``。
+    高级旋钮，默认值适用于大多数场景。"""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
@@ -316,10 +309,8 @@ class SchedulerConfig:
             self.length_aware_long_max_wait_ms > 0
             and self.length_aware_long_token_reservation <= 0
         ):
-            # The token-reservation bucket is the only channel that admits aged
-            # longs ahead of waiting shorts. With reservation == 0 the bucket
-            # never refills, so an enabled aging bound would be inert. Require an
-            # explicit positive reservation instead.
+            # 令牌桶是让老的长请求插到等待短请求之前的唯一通道。若 reservation == 0，
+            # 桶永远不会回填，开启 aging 阈值也形同虚设。因此要求显式给一个正的预留值。
             raise ValueError(
                 "length_aware_long_token_reservation must be > 0 when "
                 "length_aware_long_max_wait_ms > 0 (aging enabled); got "

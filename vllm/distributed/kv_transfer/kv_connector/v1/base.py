@@ -490,28 +490,24 @@ class KVConnectorBase_V1(ABC):
         request: "Request",
         num_computed_tokens: int,
     ) -> int:
-        """Side-effect-free estimate of the number of externally-cached tokens
-        for a request, for use in scheduling decisions (e.g. length-aware
-        prefill scheduling) *before* a request is admitted.
+        """无副作用地估计某请求可从外部（连接器）缓存命中的 token 数，供调度决策
+        在请求被真正准入*之前*使用（例如长度感知的 prefill 调度）。
 
-        Unlike ``get_num_new_matched_tokens``, this MUST be strictly
-        side-effect free: it must not reserve buffers, kick off async lookups,
-        mutate the request, or change any connector state, and it may be called
-        many times per request per step. It is a best-effort hint only.
+        与 ``get_num_new_matched_tokens`` 不同，本方法必须严格无副作用：不得预留
+        缓冲区、不得发起异步查询、不得改写请求或任何连接器状态，并且允许每步、每个
+        请求被调用多次。它只是一个尽力而为的提示。
 
-        The default implementation returns ``0`` (i.e. "no external hit
-        estimate available"), which is always safe. Connectors that can answer
-        cheaply and safely from an in-memory index may override it. Callers
-        treat a ``None`` return as ``0``.
+        默认实现返回 ``0``（即“无法给出外部命中估计”），这总是安全的。能从内存索引
+        里廉价且安全地给出答案的连接器可以覆写它。调用方会把返回的 ``None`` 当作
+        ``0`` 处理。
 
         Args:
-            request: the request object.
-            num_computed_tokens: the number of locally computed tokens for this
-                request (e.g. the local prefix-cache hit).
+            request: 请求对象。
+            num_computed_tokens: 该请求已在本地计算的 token 数（例如本地前缀缓存命中）。
 
         Returns:
-            The estimated number of externally-cached tokens beyond
-            ``num_computed_tokens`` (``0`` when unknown).
+            超出 ``num_computed_tokens`` 之外、估计可从外部缓存命中的 token 数
+            （未知时为 ``0``）。
         """
         return 0
 

@@ -361,9 +361,8 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # Refresh per-step waiting-queue state (e.g. length-aware token bucket).
-        # No-op for FCFS/priority queues. Use the full per-step token budget as
-        # the reservation base so the aged-long bucket refills consistently.
+        # 刷新每步的等待队列状态（例如长度感知的令牌桶）。对 FCFS/priority 队列是
+        # 空操作。用每步完整的 token 预算作为预留基准，使 aged-long 令牌桶稳定回填。
         self.waiting.begin_step(self.max_num_scheduled_tokens)
 
         # First, schedule the RUNNING requests.
@@ -1616,10 +1615,10 @@ class Scheduler(SchedulerInterface):
         )
 
     def _create_request_queue(self) -> RequestQueue:
-        """Build a waiting queue for the configured scheduling policy.
+        """按配置的调度策略构建等待队列。
 
-        For LENGTH_AWARE we inject a prefix-cache-aware length function and the
-        policy's tuning knobs; other policies ignore the extra arguments.
+        对 LENGTH_AWARE，注入一个感知前缀缓存的计算长度函数以及该策略的各调参项；
+        其它策略会忽略这些额外参数。
         """
         if self.policy == SchedulingPolicy.LENGTH_AWARE:
             cfg = self.scheduler_config
@@ -1635,28 +1634,24 @@ class Scheduler(SchedulerInterface):
         return create_request_queue(self.policy)
 
     def _num_tokens_to_compute(self, request: Request) -> int:
-        """Number of tokens that still need to be computed for `request`, i.e.
-        its length after removing local AND remote cache hits.
+        """`request` 仍需计算的 token 数，即扣除本地与远端缓存命中后的长度。
 
-        Used by the length-aware policy to classify short vs long prefills by
-        real compute cost rather than raw prompt length. This is evaluated
-        lazily at scheduling/selection time (not at enqueue), so both hit
-        sources reflect the live cache state:
+        供长度感知策略按真实计算开销（而非原始 prompt 长度）划分短/长 prefill。
+        它在调度/选择时惰性求值（不在入队时），因此两种命中都反映实时缓存状态：
 
-        - Local vLLM prefix cache: `KVCacheManager.get_num_cached_tokens`
-          (read-only lookup, no stats/touch/alloc).
-        - Remote KV-connector cache (P/D, offloading):
-          `connector.peek_num_new_matched_tokens`, a strictly side-effect-free
-          hint. If the connector cannot determine it (returns `None`/0), the
-          remote hit defaults to 0.
+        - 本地 vLLM 前缀缓存：`KVCacheManager.get_num_cached_tokens`
+          （只读查询，不记 stats、不 touch、不分配）。
+        - 远端 KV 连接器缓存（P/D、offloading）：
+          `connector.peek_num_new_matched_tokens`，一个严格无副作用的提示。若连接器
+          无法给出（返回 `None`/0），远端命中默认为 0。
         """
         if request.num_computed_tokens > 0:
-            # Resumed/partially-computed request: what's left is unambiguous.
+            # 续跑/已部分计算的请求：剩余量是明确的。
             return max(request.num_tokens - request.num_computed_tokens, 0)
         num_local_cached = self.kv_cache_manager.get_num_cached_tokens(request)
         num_remote_cached = 0
         if self.connector is not None:
-            # Strictly side-effect-free peek; unknown/None -> 0.
+            # 严格无副作用的 peek；未知/None -> 0。
             peeked = self.connector.peek_num_new_matched_tokens(
                 request, num_local_cached
             )
@@ -1667,8 +1662,8 @@ class Scheduler(SchedulerInterface):
 
     @staticmethod
     def _is_recovery_request(request: Request) -> bool:
-        """Recovery-style requests (preempted or already partially computed) are
-        routed to the length-aware immediate lane so they resume first."""
+        """恢复类请求（被抢占或已部分计算）会被路由到长度感知队列的 immediate lane，
+        以便优先续跑。"""
         return (
             request.status == RequestStatus.PREEMPTED
             or request.num_computed_tokens > 0

@@ -234,24 +234,22 @@ class KVCacheManager:
         return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens
 
     def get_num_cached_tokens(self, request: Request) -> int:
-        """Read-only estimate of the local prefix-cache hit length, in tokens.
+        """只读地估计本地前缀缓存命中的长度（以 token 计）。
 
-        Unlike `get_computed_blocks`, this does NOT record prefix-cache stats,
-        touch blocks, or allocate anything -- it only looks up the block-hash
-        map. It is intended for scheduling decisions that need to know how many
-        tokens can be skipped (i.e. how many tokens actually need to be
-        computed) *before* the request is popped from the waiting queue, such as
-        length-aware prefill scheduling.
+        与 `get_computed_blocks` 不同，本方法不记录前缀缓存统计、不 touch 任何 block、
+        也不分配任何东西——只查 block-hash 表。它用于那些需要在请求被弹出等待队列
+        *之前*就知道“能跳过多少 token”（即实际还需计算多少 token）的调度决策，
+        例如长度感知的 prefill 调度。
 
-        NOTE: this only reflects vLLM's local prefix cache; externally cached
-        tokens served by a KVConnector (P/D, offloading) are not included.
+        注意：这里只反映 vLLM 的本地前缀缓存；由 KVConnector（P/D、offloading）提供的
+        外部缓存命中不包含在内。
 
         Args:
-            request: The request to estimate the cache hit for.
+            request: 需要估计缓存命中的请求。
 
         Returns:
-            The number of prefix tokens already cached locally (0 if prefix
-            caching is disabled, reads are skipped, or no block hashes exist).
+            已在本地缓存的前缀 token 数（若关闭前缀缓存、跳过读取或没有 block hash，
+            则返回 0）。
         """
         if (
             not self.enable_caching
@@ -259,7 +257,7 @@ class KVCacheManager:
             or not request.block_hashes
         ):
             return 0
-        # Mirror get_computed_blocks: keep the last token for logits.
+        # 与 get_computed_blocks 保持一致：保留最后一个 token 用于产生 logits。
         max_cache_hit_length = request.num_tokens - 1
         _, num_new_computed_tokens = self.coordinator.find_longest_cache_hit(
             request.block_hashes, max_cache_hit_length

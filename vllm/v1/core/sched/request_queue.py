@@ -77,12 +77,10 @@ class RequestQueue(ABC):
         pass
 
     def begin_step(self, token_budget: int) -> None:
-        """Hook called once by the scheduler at the start of each scheduling
-        step, before the waiting queue is drained.
+        """调度器在每个调度步开始、开始消费等待队列之前调用一次的钩子。
 
-        Stateful policies (e.g. length-aware token-bucket aging) use it to
-        refresh per-step state. No-op by default so FCFS/priority queues are
-        unaffected.
+        有状态的策略（例如长度感知的令牌桶 aging）用它来刷新每步状态。默认是空操作，
+        因此 FCFS/priority 队列不受影响。
         """
         return None
 
@@ -214,63 +212,51 @@ class PriorityRequestQueue(RequestQueue):
 
 
 def _default_length_fn(request: Request) -> int:
-    """Fallback compute-length: prompt/decode length minus already-computed
-    tokens. Used when no prefix-cache-aware ``length_fn`` is supplied."""
+    """兜底的计算长度：prompt/decode 长度减去已计算的 token 数。当没有提供
+    感知前缀缓存的 ``length_fn`` 时使用。"""
     return max(request.num_tokens - request.num_computed_tokens, 0)
 
 
 class LengthAwareRequestQueue(RequestQueue):
-    """Length-aware prefill scheduling queue.
+    """长度感知的 prefill 调度队列。
 
-    Inspired by vllm-ascend PR #10285 (LAPS), but with a key structural
-    difference: **requests are NOT classified into short/long lanes at enqueue
-    time.** Prompt-length is a poor proxy for cost once caching is involved, and
-    -- more importantly -- how many tokens actually need to be computed depends
-    on the *live* cache state (local prefix cache + external KV-connector
-    cache), which changes over time and is only cheaply/safely knowable at
-    scheduling time.
+    灵感来自 vllm-ascend PR #10285 (LAPS)，但有一个关键的结构性差异：
+    **请求不在入队时被划分为短/长。** 一旦涉及缓存，prompt 长度就不能很好地代表开销；
+    更重要的是，实际还需计算多少 token 取决于*实时*的缓存状态（本地前缀缓存 + 外部
+    KV 连接器缓存），它随时间变化，且只有在调度时才能廉价且安全地得知。
 
-    Instead, classification happens lazily at **selection time**: whenever a
-    request is about to be admitted to the running set, the queue scans all
-    waiting requests, computes each one's real compute length via
-    ``length_fn(request)`` (prompt minus local *and* remote cache hits), and
-    partitions them into short (``compute_len <= threshold``) and long
-    (``> threshold``). Dispatch priority is::
+    因此分类被推迟到**选择时**惰性进行：每当一个请求即将被准入 running 集合时，
+    队列会遍历所有等待请求，通过 ``length_fn(request)`` 实时计算每个请求的真实计算
+    长度（prompt 减去本地*和*远端缓存命中），并据此划分为短（``compute_len <=
+    threshold``）与长（``> threshold``）。派发优先级为::
 
         immediate > aged-long > short > long
 
-    - **immediate**: recovery-style requests (preempted / partially computed),
-      dispatched first. Populated via ``prepend_request`` or the optional
-      ``immediate_predicate``. These are held in a small side lane and are not
-      re-scanned for length.
-    - **short**: the oldest waiting request whose (live) compute length is
-      ``<= threshold``.
-    - **long**: everything else, dispatched only when no short is available or
-      when the oldest long has aged past ``long_max_wait_ms``.
+    - **immediate**：恢复类请求（被抢占 / 已部分计算），最先派发。通过
+      ``prepend_request`` 或可选的 ``immediate_predicate`` 填充。它们放在一条独立的
+      小队列里，不参与长度扫描。
+    - **short**：实时计算长度 ``<= threshold`` 的、最老的等待请求。
+    - **long**：其余请求，仅当没有短请求可派发、或最老的长请求已 aging 超过
+      ``long_max_wait_ms`` 时才派发。
 
-    Anti-starvation uses a token bucket: it refills by
-    ``long_token_reservation * per-step token budget`` every ``begin_step`` and,
-    once the oldest long has waited ``>= long_max_wait_ms``, that long may be
-    promoted ahead of waiting shorts only while the bucket has credit. Admitting
-    an aged long ahead of shorts spends its full remaining compute length from
-    the bucket, so the aged-long admission rate stays bounded by the reservation
-    fraction and shorts always retain ``1 - reservation`` of throughput.
+    防饿死用令牌桶：每次 ``begin_step`` 回填 ``long_token_reservation * 每步 token
+    预算``；当最老的长请求已等待 ``>= long_max_wait_ms`` 时，只有在桶还有额度的情况下
+    该长请求才能被晋升到等待短请求之前。让一个 aged-long 越过短请求会从桶里扣掉它的
+    整份剩余计算长度，因此 aged-long 的准入速率被限制在预留比例内，短请求始终保留
+    ``1 - reservation`` 的吞吐。
 
-    Requests (other than immediate) are held in a single FCFS structure so that
-    "oldest" is well defined; this policy assumes a single total arrival order
-    (like FCFS).
+    除 immediate 外的请求放在单一的 FCFS 结构里，从而“最老”是明确定义的；该策略假定
+    存在单一的全序到达顺序（与 FCFS 相同）。
 
-    Cost note: selection is O(N) in the number of waiting requests (it evaluates
-    ``length_fn`` for each), so a scan is done per admitted request. The result
-    of a ``peek_request`` is cached and reused by the immediately following
-    ``pop_request`` (no queue mutation happens in between), and the cache is
-    invalidated on any mutation and at ``begin_step``.
+    开销说明：选择的复杂度为 O(N)（N 为等待请求数，会对每个请求求值 ``length_fn``），
+    因此每准入一个请求就要扫描一次。``peek_request`` 的结果会被缓存，供紧随其后的
+    ``pop_request`` 复用（两者之间不会有队列变更），并在任何变更以及 ``begin_step``
+    时失效。
 
-    NOTE: the bucket is charged inside ``pop_request``. The scheduler also pops
-    from this queue on rare "skip" paths (e.g. a request that momentarily
-    exceeds ``max_loras``); such a pop may count as an aged-long promotion. This
-    is a deliberate, benign approximation -- an occasional extra charge only
-    slows aged-long admission, which errs toward protecting short requests.
+    注意：扣桶发生在 ``pop_request`` 内。调度器在少数“跳过”路径上也会从本队列 pop
+    （例如某请求暂时超出 ``max_loras``），这样的 pop 可能被计为一次 aged-long 晋升。
+    这是有意为之的良性近似——偶尔多扣一次只会让 aged-long 准入更慢一点，方向上偏向
+    保护短请求。
     """
 
     def __init__(
@@ -289,47 +275,45 @@ class LengthAwareRequestQueue(RequestQueue):
         self.long_burst_steps = long_burst_steps
         self.immediate_predicate = immediate_predicate
 
-        # Recovery/preempted requests, dispatched first (not length-scanned).
+        # 恢复/被抢占的请求，最先派发（不参与长度扫描）。
         self._immediate = FCFSRequestQueue()
-        # Everyone else, in arrival order. NO short/long split here -- that is
-        # decided at selection time from the live compute length.
+        # 其余所有请求，按到达顺序存放。这里不做短/长划分——短/长在选择时根据实时
+        # 计算长度决定。
         self._waiting = FCFSRequestQueue()
 
-        # req_id -> the lane currently holding the request.
+        # req_id -> 当前持有该请求的 lane。
         self._queue_index: dict[str, RequestQueue] = {}
-        # req_id -> monotonic timestamp the request entered the waiting lane
-        # (used for aging).
+        # req_id -> 该请求进入等待 lane 的单调时间戳（用于 aging）。
         self._enqueue_at: dict[str, float] = {}
-        # req_ids explicitly forced into the immediate lane (recovery flows).
+        # 被显式强制放入 immediate lane 的 req_id（恢复流程）。
         self._force_immediate_ids: set[str] = set()
 
-        # Token bucket throttling aged-long admissions (see begin_step).
+        # 限制 aged-long 准入速率的令牌桶（见 begin_step）。
         self._long_bucket = 0.0
         self._long_bucket_capacity = 0.0
         self._long_refill_per_step = 0.0
 
-        # Cached selection: (request, charge_tokens). charge_tokens > 0 only for
-        # an aged-long promotion that jumps waiting shorts. Invalidated on any
-        # mutation and at begin_step.
+        # 缓存的选择结果：(request, charge_tokens)。仅当是“越过等待短请求的 aged-long
+        # 晋升”时 charge_tokens > 0。在任何变更以及 begin_step 时失效。
         self._selection: tuple[Request, int] | None = None
 
     # ------------------------------------------------------------------ #
-    # Per-step hook
+    # 每步钩子
     # ------------------------------------------------------------------ #
     def begin_step(self, token_budget: int) -> None:
-        """Refill the aged-long admission bucket for this scheduling step."""
+        """为本调度步回填 aged-long 的准入令牌桶。"""
         self._long_refill_per_step = self.long_token_reservation * token_budget
         self._long_bucket_capacity = self._long_refill_per_step * self.long_burst_steps
         self._long_bucket = min(
             self._long_bucket_capacity,
             self._long_bucket + self._long_refill_per_step,
         )
-        # Live cache state may have changed since last step, so any cached
-        # selection (which depends on compute lengths) is now stale.
+        # 距上一步，实时缓存状态可能已改变，因此任何依赖计算长度的缓存选择结果现在
+        # 都已过时。
         self._selection = None
 
     # ------------------------------------------------------------------ #
-    # Bookkeeping
+    # 记账
     # ------------------------------------------------------------------ #
     def _lane_for_enqueue(
         self, request: Request, force_immediate: bool
@@ -353,10 +337,10 @@ class LengthAwareRequestQueue(RequestQueue):
         self._force_immediate_ids.discard(rid)
 
     # ------------------------------------------------------------------ #
-    # Selection (scans all waiting requests each time)
+    # 选择（每次都遍历所有等待请求）
     # ------------------------------------------------------------------ #
     def _compute_selection(self) -> tuple[Request, int] | None:
-        # Immediate (recovery) requests always win and are not length-scanned.
+        # immediate（恢复类）请求总是优先，且不参与长度扫描。
         if self._immediate:
             return (self._immediate.peek_request(), 0)
 
@@ -366,8 +350,8 @@ class LengthAwareRequestQueue(RequestQueue):
         oldest_long_len = 0
         has_short = False
 
-        # Single pass in arrival order: the first short/long encountered is the
-        # oldest short/long. compute length is evaluated live for every request.
+        # 按到达顺序单趟遍历：遇到的第一个短/长即为最老的短/长。对每个请求都实时
+        # 求值其计算长度。
         for request in self._waiting:
             compute_len = max(self.length_fn(request), 0)
             if compute_len <= self.threshold:
@@ -378,21 +362,19 @@ class LengthAwareRequestQueue(RequestQueue):
                 oldest_long = request
                 oldest_long_len = compute_len
 
-        # Anti-starvation: the oldest long, once aged, may be promoted ahead of
-        # waiting shorts, gated by the token-reservation bucket.
+        # 防饿死：最老的长请求一旦 aging，可在令牌桶额度允许下被晋升到等待短请求之前。
         if oldest_long is not None and self.long_max_wait_ms > 0:
             enqueued_at = self._enqueue_at.get(oldest_long.request_id, now)
             waited_ms = (now - enqueued_at) * 1000.0
             if waited_ms >= self.long_max_wait_ms:
                 if not has_short:
-                    # Stall avoidance: no short waiting, run the long (no charge).
+                    # 避免空转：没有短请求在等，直接跑这个长请求（不扣桶）。
                     return (oldest_long, 0)
                 if self._long_bucket > 0.0:
-                    # Reservation credit available: promote and charge its full
-                    # remaining compute length.
+                    # 桶还有额度：晋升该长请求，并扣掉它的整份剩余计算长度。
                     return (oldest_long, oldest_long_len)
-                # Bucket exhausted with shorts waiting: prefer shorts so the
-                # aged-long admission rate stays bounded by the reservation.
+                # 桶已耗尽且有短请求在等：优先短请求，从而把 aged-long 的准入速率
+                # 限制在预留比例之内。
 
         if oldest_short is not None:
             return (oldest_short, 0)
@@ -406,7 +388,7 @@ class LengthAwareRequestQueue(RequestQueue):
         return self._selection
 
     # ------------------------------------------------------------------ #
-    # RequestQueue interface
+    # RequestQueue 接口
     # ------------------------------------------------------------------ #
     def add_request(self, request: Request) -> None:
         lane = self._lane_for_enqueue(request, force_immediate=False)
@@ -434,8 +416,8 @@ class LengthAwareRequestQueue(RequestQueue):
         return selection[0]
 
     def prepend_request(self, request: Request) -> None:
-        # Prepend == recovery/resume; always route to the immediate lane so the
-        # request is dispatched before any newly arrived waiting prefill.
+        # prepend == 恢复/续跑；一律放入 immediate lane，使该请求先于任何新到达的
+        # 等待 prefill 被派发。
         self._force_immediate_ids.add(request.request_id)
         self._immediate.prepend_request(request)
         self._track(request, self._immediate)
@@ -487,10 +469,9 @@ def create_request_queue(
     long_burst_steps: int = 4,
     immediate_predicate: Callable[[Request], bool] | None = None,
 ) -> RequestQueue:
-    """Create request queue based on scheduling policy.
+    """根据调度策略创建请求队列。
 
-    The keyword-only arguments are only consumed by
-    ``SchedulingPolicy.LENGTH_AWARE`` and ignored otherwise.
+    仅 ``SchedulingPolicy.LENGTH_AWARE`` 会使用这些仅限关键字参数，其它策略忽略之。
     """
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
