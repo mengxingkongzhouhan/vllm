@@ -571,8 +571,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         counter_connector_prefix_cache_queries = self._counter_cls(
             name="vllm:external_prefix_cache_queries",
             documentation=(
-                "External prefix cache queries from KV connector "
-                "cross-instance cache sharing, in terms of number of queried tokens."
+                "Prompt tokens considered for KV connector cross-instance "
+                "cache sharing."
             ),
             labelnames=labelnames,
         )
