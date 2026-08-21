@@ -1,6 +1,7 @@
 {
     "filetype": "generate_conversations",
     "num_conversations": 24,
+    "num_prefix_groups": 4,
     "text_files": ["pg1184.txt"],
     "print_stats": false,
     "prompt_input": {
@@ -13,7 +14,7 @@
             "distribution": "constant",
             "value": 500
         },
-        "prefix_num_tokens": {
+        "suffix_num_tokens": {
             "distribution": "lognormal",
             "average": 1000,
             "max": 5000

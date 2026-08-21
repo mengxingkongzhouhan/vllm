@@ -30,7 +30,8 @@ Then run the benchmarking script
 ```bash
 export MODEL_PATH=/models/meta-llama/Meta-Llama-3.1-8B-Instruct/
 
-python benchmark_serving_multi_turn.py --model $MODEL_PATH --served-model-name Llama \
+.venv/bin/python benchmark_serving_multi_turn.py --model $MODEL_PATH \
+--served-model-name Llama \
 --input-file generate_multi_turn.json --num-clients 2 --max-active-conversations 6
 ```
 
@@ -68,16 +69,58 @@ The file `generate_multi_turn.json` is an example file.
 
 The file must contain the sections `prompt_input` and `prompt_output`.
 
-The `prompt_input` section must contain `num_turns`, `prefix_num_tokens` and `num_tokens`:
+`num_conversations` controls how many independent conversations (agents) are
+generated. `num_prefix_groups` controls how many distinct shared prefixes are
+generated. Conversations are assigned to groups round-robin, so conversations
+0 and `num_prefix_groups` share a prefix. It defaults to 1 for compatibility.
+
+The `prompt_input` section must contain `num_turns`, `suffix_num_tokens` and
+`num_tokens`:
 
 * `num_turns` - Number of total turns in the conversation (both user & assistant).<br/>
 The final value will always be rounded to an even number so each user turn has a reply.
-* `prefix_num_tokens` - Tokens added at the start of only the **first user turn** in a conversation (unique per conversation).
+* `common_prefix_num_tokens` - Tokens shared by the conversations in one prefix
+group and added to their **first user turn**. This field is optional and defaults
+to zero.
+* `suffix_num_tokens` - Unique tokens added after the shared group prefix in the
+**first user turn**. The legacy name `prefix_num_tokens` remains supported.
 * `num_tokens` - Total token length of each **user** message (one turn).
 
 The `prompt_output` section must contain `num_tokens`:
 
 * `num_tokens` - Total token length of each **assistant** message (one turn).
+
+### Sequential prefix-cache workload
+
+Use one client when each request must finish before any subsequent request is
+sent. Multiple active conversations emulate independent agents while the
+round-robin strategy revisits each agent after receiving its previous reply:
+
+```bash
+.venv/bin/python benchmark_serving_multi_turn.py \
+  --model "$MODEL_PATH" \
+  --served-model-name Llama \
+  --input-file generate_multi_turn.json \
+  --num-clients 1 \
+  --max-active-conversations 8 \
+  --conversation-sampling round_robin \
+  --max-num-requests 100
+```
+
+The four main workload controls are:
+
+| Workload property    | Configuration                            |
+| -------------------- | ---------------------------------------- |
+| Shared prefix length | `prompt_input.common_prefix_num_tokens`  |
+| Unique suffix length | `prompt_input.suffix_num_tokens`         |
+| Prefix group count   | `num_prefix_groups`                      |
+| Request count        | `--max-num-requests`                     |
+
+The generated workload must contain at least the requested number of user
+turns. With a constant even `num_turns`, it contains
+`num_conversations * num_turns / 2` requests. Each request includes the
+conversation history, and the model's actual reply replaces the placeholder
+assistant message before that conversation's next request is sent.
 
 ### Random distributions for synthetic conversations generation
 
@@ -168,7 +211,9 @@ To run with the ShareGPT data, download the following ShareGPT dataset:
 Use the `convert_sharegpt_to_openai.py` script to convert the dataset to a format supported by `benchmark_serving_multi_turn.py`
 
 ```bash
-python convert_sharegpt_to_openai.py sharegpt_20230401_clean_lang_split.json sharegpt_conv_128.json --seed=99 --max-items=128
+.venv/bin/python convert_sharegpt_to_openai.py \
+  sharegpt_20230401_clean_lang_split.json sharegpt_conv_128.json \
+  --seed=99 --max-items=128
 ```
 
 The script will convert the ShareGPT dataset to a dataset with the standard user/assistant roles.
