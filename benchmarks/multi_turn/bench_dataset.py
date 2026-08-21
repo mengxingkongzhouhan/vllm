@@ -203,6 +203,7 @@ class LognormalDistribution(Distribution):
 
 class GenConvArgs(NamedTuple):
     num_conversations: int
+    num_prefix_groups: int
     text_files: list[str]
     input_num_turns: Distribution
     input_common_prefix_num_tokens: Distribution
@@ -307,6 +308,14 @@ def parse_input_json_file(conf: dict) -> GenConvArgs:
 
     assert conf["num_conversations"] > 0, "num_conversations should be larger than zero"
 
+    num_prefix_groups = conf.get("num_prefix_groups", 1)
+    assert isinstance(num_prefix_groups, int), (
+        "Field 'num_prefix_groups' should be an integer"
+    )
+    assert 0 < num_prefix_groups <= conf["num_conversations"], (
+        "num_prefix_groups should be positive and no larger than num_conversations"
+    )
+
     text_files = conf["text_files"]
 
     assert isinstance(text_files, list), "Field 'text_files' should be a list"
@@ -320,8 +329,17 @@ def parse_input_json_file(conf: dict) -> GenConvArgs:
     input_common_prefix_num_tokens = get_random_distribution(
         conf, "prompt_input", "common_prefix_num_tokens", optional=True
     )
+    prompt_input = conf["prompt_input"]
+    has_prefix_num_tokens = "prefix_num_tokens" in prompt_input
+    has_suffix_num_tokens = "suffix_num_tokens" in prompt_input
+    if has_prefix_num_tokens and has_suffix_num_tokens:
+        raise ValueError(
+            "Use only one of prompt_input.prefix_num_tokens and "
+            "prompt_input.suffix_num_tokens"
+        )
+    suffix_field = "suffix_num_tokens" if has_suffix_num_tokens else "prefix_num_tokens"
     input_prefix_num_tokens = get_random_distribution(
-        conf, "prompt_input", "prefix_num_tokens"
+        conf, "prompt_input", suffix_field
     )
     output_num_tokens = get_random_distribution(conf, "prompt_output", "num_tokens")
 
@@ -332,6 +350,7 @@ def parse_input_json_file(conf: dict) -> GenConvArgs:
 
     args = GenConvArgs(
         num_conversations=conf["num_conversations"],
+        num_prefix_groups=num_prefix_groups,
         text_files=text_files,
         input_num_turns=input_num_turns,
         input_common_prefix_num_tokens=input_common_prefix_num_tokens,
@@ -444,15 +463,33 @@ def generate_conversations(
     # (jump/skip over text sections between conversations)
     base_offset = 0
 
-    # Common prefix size for all conversations (only 1 sample required)
-    common_prefix_text = ""
-    common_prefix_tokens: int = args.input_common_prefix_num_tokens.sample(1)[0]
-    if common_prefix_tokens > 0:
-        # Using "." at the end to separate sentences
-        common_prefix_text = (
-            tokenizer.decode(list_of_tokens[: common_prefix_tokens - 2]) + "."
-        )
-        base_offset += common_prefix_tokens
+    # Each group has a distinct prefix shared by its conversations.
+    common_prefix_texts: list[str] = []
+    common_prefix_token_counts = args.input_common_prefix_num_tokens.sample(
+        args.num_prefix_groups
+    ).astype(int)
+    for common_prefix_tokens in common_prefix_token_counts:
+        common_prefix_text = ""
+        if common_prefix_tokens > 0:
+            start_offset = base_offset
+            end_offset = start_offset + common_prefix_tokens
+            assert len(list_of_tokens) > end_offset, (
+                "Not enough input text to generate "
+                f"{common_prefix_tokens} tokens for a shared prefix "
+                f"({start_offset=}, {end_offset=})"
+            )
+            # Using "." at the end to separate sentences
+            prefix_content_tokens = max(0, common_prefix_tokens - 2)
+            common_prefix_text = (
+                tokenizer.decode(
+                    list_of_tokens[
+                        start_offset : start_offset + prefix_content_tokens
+                    ]
+                )
+                + "."
+            )
+            base_offset = end_offset
+        common_prefix_texts.append(common_prefix_text)
 
     for conv_id in tqdm(
         range(args.num_conversations),
@@ -464,6 +501,8 @@ def generate_conversations(
         messages: MessagesList = []
 
         nturns = turn_count[conv_id]
+        prefix_group_id = conv_id % args.num_prefix_groups
+        common_prefix_text = common_prefix_texts[prefix_group_id]
 
         # User prompt token count per turn (with lower limit)
         input_token_count: np.ndarray = args.input_num_tokens.sample(nturns).astype(int)
