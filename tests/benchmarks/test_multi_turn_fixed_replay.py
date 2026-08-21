@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import copy
 import importlib
@@ -5,9 +7,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-MULTI_TURN_BENCHMARK_DIR = (
-    Path(__file__).parents[2] / "benchmarks" / "multi_turn"
-)
+MULTI_TURN_BENCHMARK_DIR = Path(__file__).parents[2] / "benchmarks" / "multi_turn"
 sys.path.insert(0, str(MULTI_TURN_BENCHMARK_DIR))
 benchmark = importlib.import_module("benchmark_serving_multi_turn")
 
