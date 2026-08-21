@@ -176,3 +176,30 @@ The script will convert the ShareGPT dataset to a dataset with the standard user
 The flag `--max-items=128` is used to sample 128 conversations from the original dataset (change as needed).
 
 Use the output JSON file `sharegpt_conv_128.json` as the `--input-file` for `benchmark_serving_multi_turn.py`.
+
+## Replaying Fixed Requests
+
+By default, each server response replaces the corresponding assistant answer
+from the input dataset and becomes part of the next request. Use
+`--fixed-dataset-replay` to keep the dataset answers as history instead. The
+benchmark still waits for each response before sending the next turn, but the
+response content cannot change later request payloads.
+
+For a globally fixed request order, use one client, one active conversation,
+round-robin conversation sampling, and no random request delay:
+
+```bash
+python benchmark_serving_multi_turn.py \
+  --model $MODEL_PATH \
+  --served-model-name Llama \
+  --input-file fixed_conversations.json \
+  --fixed-dataset-replay \
+  --num-clients 1 \
+  --max-active-conversations 1 \
+  --conversation-sampling round_robin \
+  --request-rate 0 \
+  --seed 0
+```
+
+The input file must also be unchanged between runs. For generated conversations,
+use constant distributions for all numeric fields to avoid varying lengths.
