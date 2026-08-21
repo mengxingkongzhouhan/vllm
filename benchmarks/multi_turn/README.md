@@ -109,12 +109,12 @@ round-robin strategy revisits each agent after receiving its previous reply:
 
 The four main workload controls are:
 
-| Workload property | Configuration |
-|---|---|
-| Shared prefix length | `prompt_input.common_prefix_num_tokens` |
-| Unique suffix length | `prompt_input.suffix_num_tokens` |
-| Prefix group count | `num_prefix_groups` |
-| Request count | `--max-num-requests` |
+| Workload property    | Configuration                            |
+| -------------------- | ---------------------------------------- |
+| Shared prefix length | `prompt_input.common_prefix_num_tokens`  |
+| Unique suffix length | `prompt_input.suffix_num_tokens`         |
+| Prefix group count   | `num_prefix_groups`                      |
+| Request count        | `--max-num-requests`                     |
 
 The generated workload must contain at least the requested number of user
 turns. With a constant even `num_turns`, it contains

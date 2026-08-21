@@ -482,9 +482,7 @@ def generate_conversations(
             prefix_content_tokens = max(0, common_prefix_tokens - 2)
             common_prefix_text = (
                 tokenizer.decode(
-                    list_of_tokens[
-                        start_offset : start_offset + prefix_content_tokens
-                    ]
+                    list_of_tokens[start_offset : start_offset + prefix_content_tokens]
                 )
                 + "."
             )

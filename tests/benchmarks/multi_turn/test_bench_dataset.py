@@ -64,3 +64,16 @@ def test_parse_rejects_more_prefix_groups_than_conversations(tmp_path: Path) -> 
 
     with pytest.raises(AssertionError, match="no larger than num_conversations"):
         parse_input_json_file(config)
+
+
+def test_parse_preserves_legacy_single_prefix_group(tmp_path: Path) -> None:
+    config = make_config(tmp_path / "source.txt")
+    config.pop("num_prefix_groups")
+    config["prompt_input"]["prefix_num_tokens"] = config["prompt_input"].pop(
+        "suffix_num_tokens"
+    )
+
+    args = parse_input_json_file(config)
+
+    assert args.num_prefix_groups == 1
+    assert args.input_prefix_num_tokens.sample(1)[0] == 4
