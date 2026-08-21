@@ -53,6 +53,7 @@ class ClientArgs(NamedTuple):
     verbose: bool
     print_content: bool
     verify_output: bool
+    fixed_dataset_replay: bool
     conversation_sampling: ConversationSampling
     request_rate: float
     max_retries: int
@@ -400,6 +401,7 @@ async def send_turn(
     req_args: RequestArgs,
     verbose: bool,
     verify_output: bool,
+    fixed_dataset_replay: bool,
 ) -> RequestStats | None:
     assert messages_to_use > 0
     assert messages_to_use <= len(conversation_messages)
@@ -545,8 +547,8 @@ async def send_turn(
             if orig_content != output_content:
                 raise ValueError(debug_info)
 
-        # Update the answer
-        conversation_messages[answer_index]["content"] = output_content
+        if not fixed_dataset_replay:
+            conversation_messages[answer_index]["content"] = output_content
     else:
         # A user prompt that has no answer, add the answer as a new message
         new_answer = {"role": "assistant", "content": output_content}
@@ -729,6 +731,7 @@ async def client_main(
                         req_args,
                         args.print_content,
                         args.verify_output,
+                        args.fixed_dataset_replay,
                     )
                     if result is not None:
                         result_queue.put(result)
@@ -883,6 +886,7 @@ def get_client_config(
         verbose=args.verbose,
         print_content=args.print_content,
         verify_output=args.verify_output,
+        fixed_dataset_replay=args.fixed_dataset_replay,
         conversation_sampling=args.conversation_sampling,
         request_rate=args.request_rate,
         max_retries=args.max_retries,
@@ -1474,6 +1478,16 @@ async def main() -> None:
         help="Verify the LLM output (compare to the answers in the input JSON file)",
     )
     parser.add_argument(
+        "--fixed-dataset-replay",
+        default=False,
+        action="store_true",
+        help=(
+            "Keep assistant answers from the input dataset as conversation history "
+            "instead of replacing them with server responses. Requests still wait "
+            "for each response, making subsequent payloads reproducible."
+        ),
+    )
+    parser.add_argument(
         "--request-timeout-sec",
         type=int,
         default=120,
@@ -1557,6 +1571,8 @@ async def main() -> None:
 
     if args.verify_output:
         logger.info(f"{Color.PURPLE}Verify is enabled{Color.RESET}")
+    if args.fixed_dataset_replay:
+        logger.info(f"{Color.PURPLE}Fixed dataset replay is enabled{Color.RESET}")
 
     # Calculate the amount of samples to filter (as warmup samples/measurements).
     try:
@@ -1719,6 +1735,7 @@ async def main() -> None:
         "num_conversations": len(conversations),
         "active_conversations": args.max_active_conversations,
         "seed": args.seed,
+        "fixed_dataset_replay": args.fixed_dataset_replay,
     }
 
     if args.limit_min_tokens > 0:
