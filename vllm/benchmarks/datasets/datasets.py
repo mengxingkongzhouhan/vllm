@@ -1537,6 +1537,7 @@ class TimedTrace(BenchmarkDataset):
         num_requests: int,
         request_id_prefix: str = "",
         no_oversample: bool = False,
+        output_len: int | None = None,
         **kwargs,
     ) -> list[SampleRequest]:
         samples: list[SampleRequest] = []
@@ -1558,15 +1559,18 @@ class TimedTrace(BenchmarkDataset):
                     f"Use --label-input-length to specify the correct "
                     f"field name."
                 )
-            new_output_len = entry.get(self.label_output_length)
-            if new_output_len is None:
-                raise ValueError(
-                    f"Output length field '{self.label_output_length}' "
-                    f"not found in trace entry. "
-                    f"Available fields: {list(entry.keys())}. "
-                    f"Use --label-output-length to specify the correct "
-                    f"field name."
-                )
+            if output_len is not None:
+                new_output_len = output_len
+            else:
+                new_output_len = entry.get(self.label_output_length)
+                if new_output_len is None:
+                    raise ValueError(
+                        f"Output length field '{self.label_output_length}' "
+                        f"not found in trace entry. "
+                        f"Available fields: {list(entry.keys())}. "
+                        f"Use --label-output-length to specify the correct "
+                        f"field name."
+                    )
             prompt_ids = self._expand_prompt(
                 entry.get(self.label_hash_ids, []), input_length, tokenizer
             )
@@ -1769,6 +1773,16 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
         type=str,
         default="output_length",
         help=("What json label to use to index the output length field in the trace."),
+    )
+    timed_trace_group.add_argument(
+        "--timed-trace-output-len",
+        type=int,
+        default=None,
+        help=(
+            "Output length for each request. Overrides the per-request "
+            "output length loaded from the timed trace. Also set by "
+            "the general --output-len flag."
+        ),
     )
     timed_trace_group.add_argument(
         "--timed-trace-label-hash-ids",
@@ -2339,10 +2353,14 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
 
     elif args.dataset_name == "timed_trace":
         dataloader = TimedTrace(**vars(args))
+        timed_trace_output_len = getattr(args, "timed_trace_output_len", None)
+        if timed_trace_output_len is None:
+            timed_trace_output_len = getattr(args, "output_len", None)
         input_requests = dataloader.sample(
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
             request_id_prefix=args.request_id_prefix,
+            output_len=timed_trace_output_len,
         )
 
     else:
