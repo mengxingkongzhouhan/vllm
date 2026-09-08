@@ -1550,7 +1550,8 @@ def add_cli_args(parser: FlexibleArgumentParser):
         type=int,
         default=None,
         help="General output length for datasets. Maps to dataset-specific "
-        "output length arguments (e.g., --random-output-len, --sonnet-output-len). "
+        "output length arguments (e.g., --random-output-len, "
+        "--sonnet-output-len, --timed-trace-output-len). "
         "If not specified, uses dataset defaults.",
     )
     parser.add_argument(
@@ -2008,6 +2009,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         args.hf_output_len = args.output_len
         args.spec_bench_output_len = args.output_len
         args.prefix_repetition_output_len = args.output_len
+        args.timed_trace_output_len = args.output_len
 
     # when using random datasets, default to ignoring EOS
     # so generation runs to the requested length
